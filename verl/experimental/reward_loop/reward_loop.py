@@ -131,6 +131,12 @@ class RewardLoopWorker:
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
+        if hasattr(self.reward_manager, "run_batch"):
+            outputs = self.reward_manager.run_batch(data)
+            if asyncio.iscoroutine(outputs):
+                outputs = await outputs
+            return outputs
+
         tasks = []
         for i in range(len(data)):
             tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
@@ -309,14 +315,41 @@ class RewardLoopManager:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
-        chunks = data.chunk(len(self.reward_loop_workers))
-        outputs = ray.get(
-            [
-                worker.compute_score_batch.remote(chunk)
-                for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
-            ]
-        )
-        outputs_flat = [item for sublist in outputs for item in sublist]
+        num_workers = len(self.reward_loop_workers)
+        group_key = None
+        if self.config.reward.reward_manager.name == "tournament":
+            if "uid" in data.non_tensor_batch:
+                group_key = "uid"
+            elif "query" in data.non_tensor_batch:
+                group_key = "query"
+        use_uid_group_chunking = group_key is not None
+
+        if use_uid_group_chunking:
+            chunks, chunk_indices = self._chunk_by_key(data, num_workers, group_key=group_key)
+            outputs = ray.get(
+                [
+                    worker.compute_score_batch.remote(chunk)
+                    for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+                ]
+            )
+            outputs_flat: list[dict | None] = [None for _ in range(len(data))]
+            for worker_outputs, indices in zip(outputs, chunk_indices, strict=True):
+                assert len(worker_outputs) == len(indices), (
+                    f"Mismatch outputs size and chunk indices size, got {len(worker_outputs)} vs {len(indices)}"
+                )
+                for local_idx, global_idx in enumerate(indices):
+                    outputs_flat[global_idx] = worker_outputs[local_idx]
+            assert all(item is not None for item in outputs_flat), "Incomplete reward outputs after uid chunking"
+            outputs_flat = [item for item in outputs_flat if item is not None]
+        else:
+            chunks = data.chunk(num_workers)
+            outputs = ray.get(
+                [
+                    worker.compute_score_batch.remote(chunk)
+                    for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+                ]
+            )
+            outputs_flat = [item for sublist in outputs for item in sublist]
 
         # compute rm score
         scores = [item["reward_score"] for item in outputs_flat]
@@ -340,6 +373,31 @@ class RewardLoopManager:
         return DataProto(
             batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"reward_extra_keys": reward_extra_keys}
         )
+
+    def _chunk_by_key(
+        self, data: DataProto, num_chunks: int, group_key: str
+    ) -> tuple[list[DataProto], list[list[int]]]:
+        value_groups: dict[str, list[int]] = {}
+        value_order: list[str] = []
+        for i, value in enumerate(data.non_tensor_batch[group_key]):
+            value_str = str(value)
+            if value_str not in value_groups:
+                value_groups[value_str] = []
+                value_order.append(value_str)
+            value_groups[value_str].append(i)
+
+        chunk_indices: list[list[int]] = [[] for _ in range(num_chunks)]
+        chunk_sizes: list[int] = [0 for _ in range(num_chunks)]
+
+        # greedy assignment by current chunk size to balance workload while keeping uid-group integrity
+        for value in value_order:
+            indices = value_groups[value]
+            target_chunk = min(range(num_chunks), key=lambda idx: chunk_sizes[idx])
+            chunk_indices[target_chunk].extend(indices)
+            chunk_sizes[target_chunk] += len(indices)
+
+        chunks = [data.select_idxs(indices) for indices in chunk_indices]
+        return chunks, chunk_indices
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():
