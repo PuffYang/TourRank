@@ -407,6 +407,16 @@ class RayPPOTrainer:
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
+        def _json_default(obj: Any):
+            # Make numpy / torch objects JSON-serializable when dumping rollout samples.
+            if isinstance(obj, np.generic):
+                return obj.item()
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu().tolist()
+            raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
         n = len(inputs)
         base_data = {
             "input": inputs,
@@ -423,7 +433,7 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=_json_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
