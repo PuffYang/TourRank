@@ -1,0 +1,17 @@
+tools:
+  - class_name: verl.tools.dr_tulu_search_tools.GoogleSearchTool
+    config:
+      type: native
+      timeout: 30
+      backend: runway
+      url: https://runway.devops.xiaohongshu.com/openai/zhipu/paas/v4/web_search
+      api_key_env: RUNWAY_WEB_SEARCH_API_KEY
+      search_engine: search_prime
+      query_rewrite: "false"
+      max_results: 10
+
+  - class_name: verl.tools.dr_tulu_search_tools.BrowseWebpageTool
+    config:
+      type: native
+      timeout: 30
+      max_content_length: 6000
