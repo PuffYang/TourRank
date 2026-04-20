@@ -85,8 +85,9 @@ gpt_judge:
   fallback_to_first_on_error: True
   lose_score: 0.0
   # --- Tournament ranking hyper-parameters ---
-  # Number of groups to split candidates into each round.
-  num_groups: 2
+  # Fixed size of each group (e.g. 2 for pairwise comparison).
+  # The number of groups adapts automatically to the candidate count.
+  group_size: 2
   # Number of winners selected from each group per round.
   num_winners_per_group: 1
   # Stop the tournament when this many finalists remain.

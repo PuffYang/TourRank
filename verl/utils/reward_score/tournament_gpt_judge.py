@@ -4,7 +4,9 @@ Instead of scoring each rollout independently (absolute scoring), this module
 groups rollouts for the same query and runs a multi-round tournament:
 
 1. All *n* rollouts for a query enter the first round as candidates.
-2. Each round partitions candidates into ``num_groups`` groups.
+2. Each round partitions candidates into groups of fixed size
+   ``group_size`` (default 2 for pairwise comparison).  The number of
+   groups adapts automatically to the number of alive candidates.
 3. For every group a single GPT-4o call compares the candidates and selects
    ``num_winners_per_group`` winners.
 4. Winners receive ``score_increment`` points and advance; losers are
@@ -85,11 +87,12 @@ def _get_judge_config(gpt_judge: Any = None, **kwargs) -> dict[str, Any]:
         "api_version": "2024-06-01",
         "azure_endpoint": None,
         # tournament-specific defaults
-        "num_groups": 2,
+        "group_size": 2,
         "num_winners_per_group": 1,
         "target_finalists": 1,
         "score_increment": 1.0,
         "max_concurrency": 8,
+        "num_tournament_repeats": 1,
     }
     cfg.update(_as_dict(gpt_judge))
     for key in list(cfg):
@@ -450,7 +453,7 @@ async def _run_tournament_async(
         *rollout_texts*).
     """
     n = len(rollout_texts)
-    num_groups = max(1, int(cfg.get("num_groups", 2)))
+    group_size = max(2, int(cfg.get("group_size", 2)))
     num_winners_per_group = max(1, int(cfg.get("num_winners_per_group", 1)))
     target_finalists = max(1, int(cfg.get("target_finalists", 1)))
     score_increment = float(cfg.get("score_increment", 1.0))
@@ -474,17 +477,12 @@ async def _run_tournament_async(
         round_num += 1
         num_alive = len(candidate_indices)
 
-        # Determine effective num_groups for this round.
-        # Each group must have at least 2 candidates for a meaningful
-        # comparison; reduce the number of groups when necessary.
-        effective_num_groups = min(num_groups, num_alive)
-        # Ensure every group gets >= 2 members (otherwise the group is
-        # trivially won and the round makes no progress).
-        while effective_num_groups > 1 and num_alive // effective_num_groups < 2:
-            effective_num_groups -= 1
-        effective_num_groups = max(1, effective_num_groups)
-        if effective_num_groups < 1:
-            break
+        # Determine number of groups from fixed group_size.
+        # Use floor division so every group has at least ``group_size``
+        # members; the last group may be slightly larger when there is
+        # a remainder, avoiding groups of size 1 that would auto-advance
+        # without any comparison.
+        effective_num_groups = max(1, num_alive // group_size)
 
         # Partition candidates into groups as evenly as possible
         random.shuffle(candidate_indices)
@@ -496,10 +494,17 @@ async def _run_tournament_async(
         groups = [g for g in groups if g]
 
         logger.info(
-            "Tournament round %d: %d candidates -> %d groups",
+            "Tournament round %d: %d candidates -> %d groups (group_size=%d)",
             round_num,
             len(candidate_indices),
             len(groups),
+            group_size,
+        )
+
+        print(
+            f"[DIAG] Tournament round {round_num}: {num_alive} candidates -> "
+            f"{len(groups)} groups, sizes={[len(g) for g in groups]}",
+            flush=True,
         )
 
         # Judge each group concurrently
@@ -577,8 +582,16 @@ async def _run_tournament_async(
     return scores
 
 
-def _normalize_tournament_scores(scores: list[float]) -> list[float]:
-    """Normalise tournament scores to [0, 1]."""
+def _normalize_tournament_scores(scores: list[float], equal_score_reward: float = 0.5) -> list[float]:
+    """Normalise tournament scores to [0, 1].
+
+    Parameters
+    ----------
+    scores : list[float]
+        Raw cumulative tournament scores.
+    equal_score_reward : float
+        Value to assign when all scores are identical (default 0.5).
+    """
     if not scores:
         return scores
     min_s = min(scores)
@@ -586,8 +599,9 @@ def _normalize_tournament_scores(scores: list[float]) -> list[float]:
     denom = max_s - min_s
     if denom < 1e-12:
         # All scores equal – give everyone the same normalised score
-        print(f"[DIAG] _normalize_tournament_scores: ALL EQUAL, scores={scores}", flush=True)
-        return [0.5] * len(scores)
+        print(f"[DIAG] _normalize_tournament_scores: ALL EQUAL, scores={scores}, "
+              f"equal_score_reward={equal_score_reward}", flush=True)
+        return [equal_score_reward] * len(scores)
     norm = [(s - min_s) / denom for s in scores]
     print(f"[DIAG] _normalize_tournament_scores: raw={scores}, norm={norm}", flush=True)
     return norm
@@ -651,9 +665,12 @@ async def compute_score_batch(
     reward_kwargs: dict[str, Any] | None = None,
     **kwargs,
 ) -> list[dict[str, float]]:
-    print(f"[DIAG] tournament_gpt_judge.compute_score_batch: "
-          f"num_items={len(items)}, gpt_judge_keys={list((gpt_judge or {}).keys())}", flush=True)
     """Score a batch of rollouts belonging to the **same query** using tournament ranking.
+
+    When ``num_tournament_repeats > 1`` the full tournament is executed
+    multiple times (each time starting from scratch with all *n* rollouts)
+    and per-rollout scores are accumulated across repeats before a single
+    normalisation step.
 
     Parameters
     ----------
@@ -674,6 +691,13 @@ async def compute_score_batch(
     format_penalty = str(kwargs.get("format_penalty", reward_kwargs.get("format_penalty", "easy")))
     cfg = _get_judge_config(gpt_judge=gpt_judge, **kwargs)
 
+    num_repeats = max(1, int(cfg.get("num_tournament_repeats", 1)))
+    equal_score_reward = float(cfg.get("equal_score_reward", 0.5))
+
+    print(f"[DIAG] tournament_gpt_judge.compute_score_batch: "
+          f"num_items={len(items)}, num_tournament_repeats={num_repeats}, "
+          f"gpt_judge_keys={list((gpt_judge or {}).keys())}", flush=True)
+
     if not items:
         return []
 
@@ -693,16 +717,31 @@ async def compute_score_batch(
             text = text[: int(cfg["max_rollout_chars"])]
         rollout_texts.append(text)
 
-    # Run tournament
-    raw_scores = await _run_tournament_async(
-        query=query,
-        rubrics=rubrics,
-        rollout_texts=rollout_texts,
-        cfg=cfg,
-    )
+    n = len(items)
 
-    # Normalise tournament scores to [0, 1]
-    norm_scores = _normalize_tournament_scores(raw_scores)
+    # Accumulate tournament scores across repeats
+    total_scores = [0.0] * n
+    for repeat_idx in range(num_repeats):
+        if num_repeats > 1:
+            print(f"[DIAG] Tournament repeat {repeat_idx + 1}/{num_repeats} starting "
+                  f"(all {n} rollouts re-enter)", flush=True)
+
+        repeat_scores = await _run_tournament_async(
+            query=query,
+            rubrics=rubrics,
+            rollout_texts=rollout_texts,
+            cfg=cfg,
+        )
+
+        for i in range(n):
+            total_scores[i] += repeat_scores[i]
+
+        if num_repeats > 1:
+            print(f"[DIAG] Tournament repeat {repeat_idx + 1}/{num_repeats} done, "
+                  f"repeat_scores={repeat_scores}, total_scores={total_scores}", flush=True)
+
+    # Normalise accumulated scores to [0, 1]
+    norm_scores = _normalize_tournament_scores(total_scores, equal_score_reward=equal_score_reward)
 
     # Assemble per-item results
     results: list[dict[str, float]] = []
@@ -712,7 +751,8 @@ async def compute_score_batch(
             solution_str=solution_strs[i],
             format_penalty=format_penalty,
         )
-        result["tournament_cumulative_score"] = raw_scores[i]
+        result["tournament_cumulative_score"] = total_scores[i]
+        result["tournament_num_repeats"] = float(num_repeats)
         results.append(result)
 
     return results
