@@ -151,7 +151,7 @@ trainer:
     enable: True
 
     # Whether to also run OOD validation during the optional validation-before-training step
-    run_on_initial_validation: False
+    run_on_initial_validation: True
 
     # Local directory containing prepared OOD benchmark JSONL files
     data_dir: /mnt/tidal-alsh-share2/usr/yangzixuan/TourRank/DR-Tulu/data/RL/val
