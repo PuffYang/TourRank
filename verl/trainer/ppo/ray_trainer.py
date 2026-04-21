@@ -449,14 +449,15 @@ class RayPPOTrainer:
             "gts",
             "gpt_judge_raw_score",
             "gpt_judge_normalized_score",
-            "tournament_cumulative_score",
+            "citation_reward",
+            "citation_format_reward",
+            "citation_avg_claim_recall",
+            "citation_avg_claim_precision",
+            "citation_avg_claim_f1",
+            "citation_num_claims",
             "format_reward",
-            "retrieval_reward",
-            "cite_reward",
-            "sum_format_reward",
-            "weighted_format_reward",
-            "citation_violation",
-            "naked_text",
+            "search_turns_reward",
+            "num_search_turns",
             "final_reward",
         ]
 
@@ -531,6 +532,7 @@ class RayPPOTrainer:
         if not reward_extra_infos_dict:
             return
 
+        # GPT Judge Reward (weight: 0.5)
         raw_score = self._to_1d_float_array(reward_extra_infos_dict.get("gpt_judge_raw_score"))
         if raw_score.size > 0:
             metrics["training/gpt_judge_raw_score"] = float(np.mean(raw_score))
@@ -539,40 +541,48 @@ class RayPPOTrainer:
         if normalized_score.size > 0:
             metrics["training/gpt_judge_normalized_score"] = float(np.mean(normalized_score))
 
-        tournament_cumulative = self._to_1d_float_array(reward_extra_infos_dict.get("tournament_cumulative_score"))
-        if tournament_cumulative.size > 0:
-            metrics["training/tournament_cumulative_score"] = float(np.mean(tournament_cumulative))
+        # Citation Reward (weight: 0.2)
+        citation_reward = self._to_1d_float_array(reward_extra_infos_dict.get("citation_reward"))
+        if citation_reward.size > 0:
+            metrics["training/citation_reward"] = float(np.mean(citation_reward))
 
-        # Format reward metrics (strict mode: 3 separate metrics; easy mode: 2 metrics)
+        citation_format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("citation_format_reward"))
+        if citation_format_reward.size > 0:
+            metrics["training/citation_format_reward"] = float(np.mean(citation_format_reward))
+
+        citation_avg_claim_recall = self._to_1d_float_array(reward_extra_infos_dict.get("citation_avg_claim_recall"))
+        if citation_avg_claim_recall.size > 0:
+            metrics["training/citation_avg_claim_recall"] = float(np.mean(citation_avg_claim_recall))
+
+        citation_avg_claim_precision = self._to_1d_float_array(
+            reward_extra_infos_dict.get("citation_avg_claim_precision")
+        )
+        if citation_avg_claim_precision.size > 0:
+            metrics["training/citation_avg_claim_precision"] = float(np.mean(citation_avg_claim_precision))
+
+        citation_avg_claim_f1 = self._to_1d_float_array(reward_extra_infos_dict.get("citation_avg_claim_f1"))
+        if citation_avg_claim_f1.size > 0:
+            metrics["training/citation_avg_claim_f1"] = float(np.mean(citation_avg_claim_f1))
+
+        citation_num_claims = self._to_1d_float_array(reward_extra_infos_dict.get("citation_num_claims"))
+        if citation_num_claims.size > 0:
+            metrics["training/citation_num_claims"] = float(np.mean(citation_num_claims))
+
+        # Format Reward (weight: 0.2)
         format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("format_reward"))
         if format_reward.size > 0:
             metrics["training/format_reward"] = float(np.mean(format_reward))
 
-        retrieval_reward = self._to_1d_float_array(reward_extra_infos_dict.get("retrieval_reward"))
-        if retrieval_reward.size > 0:
-            metrics["training/retrieval_reward"] = float(np.mean(retrieval_reward))
+        # Search Turns Reward (weight: 0.1)
+        search_turns_reward = self._to_1d_float_array(reward_extra_infos_dict.get("search_turns_reward"))
+        if search_turns_reward.size > 0:
+            metrics["training/search_turns_reward"] = float(np.mean(search_turns_reward))
 
-        cite_reward = self._to_1d_float_array(reward_extra_infos_dict.get("cite_reward"))
-        if cite_reward.size > 0:
-            metrics["training/cite_reward"] = float(np.mean(cite_reward))
+        num_search_turns = self._to_1d_float_array(reward_extra_infos_dict.get("num_search_turns"))
+        if num_search_turns.size > 0:
+            metrics["training/num_search_turns"] = float(np.mean(num_search_turns))
 
-        sum_format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("sum_format_reward"))
-        if sum_format_reward.size > 0:
-            metrics["training/sum_format_reward"] = float(np.mean(sum_format_reward))
-
-        weighted_format_reward = self._to_1d_float_array(reward_extra_infos_dict.get("weighted_format_reward"))
-        if weighted_format_reward.size > 0:
-            metrics["training/weighted_format_reward"] = float(np.mean(weighted_format_reward))
-
-        # Diagnostic flags (strict mode only)
-        citation_violation = self._to_1d_float_array(reward_extra_infos_dict.get("citation_violation"))
-        if citation_violation.size > 0:
-            metrics["training/citation_violation_rate"] = float(np.mean(citation_violation))
-
-        naked_text = self._to_1d_float_array(reward_extra_infos_dict.get("naked_text"))
-        if naked_text.size > 0:
-            metrics["training/naked_text_rate"] = float(np.mean(naked_text))
-
+        # Final composite reward
         final_reward = np.array([], dtype=np.float32)
         for key in ("final_reward", "reward"):
             final_reward = self._to_1d_float_array(reward_extra_infos_dict.get(key))

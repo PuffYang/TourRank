@@ -40,19 +40,13 @@ from typing import Any
 
 from openai import AzureOpenAI
 
-from verl.utils.reward_score.search_r1_like_qa_em import (
-    compute_format_reward as compute_search_r1_format_reward,
-)
-
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-FORMAT_REWARD_WEIGHT = 0.2
 _CLIENT_CACHE: dict[tuple[str, str, str], AzureOpenAI] = {}
 
 # ---------------------------------------------------------------------------
-# Helpers shared with rubric_gpt_judge (duplicated intentionally so the file
-# remains self-contained)
+# Helpers kept local so the file remains self-contained.
 # ---------------------------------------------------------------------------
 
 
@@ -66,7 +60,6 @@ def _as_dict(value: Any) -> dict[str, Any]:
     except Exception:
         return {}
 
-
 def _get_judge_config(gpt_judge: Any = None, **kwargs) -> dict[str, Any]:
     cfg = {
         "model": "gpt-4o",
@@ -77,10 +70,6 @@ def _get_judge_config(gpt_judge: Any = None, **kwargs) -> dict[str, Any]:
         "retry_sleep": 1.5,
         "enable_content_filter_retry": True,
         "max_rollout_chars": 12000,
-        "fallback_to_first_on_error": True,
-        "score_normalization": "fixed_range",
-        "score_range_min": 0.0,
-        "score_range_max": 10.0,
         "equal_score_reward": 0.5,
         "lose_score": 0.0,
         "api_key": None,
@@ -108,6 +97,8 @@ def _get_client(cfg: dict[str, Any]) -> AzureOpenAI:
     api_key = cfg.get("api_key")
     azure_endpoint = cfg.get("azure_endpoint")
     api_version = str(cfg.get("api_version", "2024-06-01"))
+    client_url_kind = None
+    client_url_value = None
     print(f"[DIAG] _get_client: api_key={'SET' if api_key else 'NONE'}, "
           f"azure_endpoint={azure_endpoint!r}, api_version={api_version}", flush=True)
     if not api_key:
@@ -133,16 +124,6 @@ def _extract_query_and_rubrics(ground_truth: Any, extra_info: dict[str, Any] | N
     if not isinstance(rubrics, list):
         rubrics = []
     return query, rubrics
-
-
-def _compute_format_reward(text: str, format_penalty: str = "easy") -> dict[str, float] | float:
-    mcp_parser_name = "dr_tulu_xml" if "<call_tool name=" in (text or "") else None
-    return compute_search_r1_format_reward(
-        text or "",
-        mcp_parser_name=mcp_parser_name,
-        format_penalty=format_penalty,
-    )
-
 
 def _strip_think_blocks(text: str) -> str:
     cleaned = text or ""
@@ -409,11 +390,7 @@ def _judge_tournament_group(
             print(f"[DIAG] _judge_tournament_group: API ERROR attempt {attempt}: {exc!r}", flush=True)
             if _is_content_filter_error(exc) and prompt_index < len(prompt_candidates) - 1:
                 prompt_index += 1
-                logger.warning(
-                    "Tournament judge prompt hit content filter; switch to safer prompt stage %d/%d.",
-                    prompt_index + 1,
-                    len(prompt_candidates),
-                )
+                logger.warning("Judge prompt hit content filter; switch to safer prompt stage %d/%d.", prompt_index + 1, len(prompt_candidates))
                 continue
             if attempt < int(cfg["max_retries"]):
                 time.sleep(float(cfg["retry_sleep"]) * attempt)
@@ -615,42 +592,100 @@ def _normalize_tournament_scores(scores: list[float], equal_score_reward: float 
 def _assemble_final_reward(
     normalized_tournament_score: float,
     solution_str: str,
-    format_penalty: str,
+    tournament_cumulative_score: float = 0.0,
+    ground_truth: dict[str, Any] | None = None,
+    mcp_parser_name: str | None = None,
+    min_tournament_score: float = 0.0,
+    max_tournament_score: float = 10.0,
+    gpt_judge_config: dict[str, Any] | None = None,
 ) -> dict[str, float]:
-    """Combine tournament score with format reward to produce final result dict."""
-    format_result = _compute_format_reward(solution_str, format_penalty=format_penalty)
-
-    if format_penalty == "strict":
-        format_reward = float(format_result["format_reward"])
-        retrieval_reward = float(format_result["retrieval_reward"])
-        cite_reward = float(format_result["cite_reward"])
-        sum_format_reward = float(format_result["sum_format_reward"])
-        effective_format_reward = sum_format_reward
-    else:
-        format_reward = float(format_result)
-        weighted_format_reward = FORMAT_REWARD_WEIGHT * format_reward
-        effective_format_reward = weighted_format_reward
-
-    final_reward = float(normalized_tournament_score + effective_format_reward)
-
+    """Combine tournament score with citation, format, and search turn rewards.
+    
+    Uses the composite reward formula:
+    final_reward = 0.5 * gpt_judge_normalized + 0.2 * citation + 0.2 * format + 0.1 * search_turns
+    
+    Args:
+        normalized_tournament_score: Pre-normalized tournament score (for compatibility)
+        solution_str: The model's response text
+        tournament_cumulative_score: Raw tournament cumulative score
+        ground_truth: Ground truth data
+        mcp_parser_name: MCP parser name for tool extraction
+        min_tournament_score: Minimum tournament score in the batch
+        max_tournament_score: Maximum tournament score in the batch
+    """
+    from verl.utils.reward_score.tourrank_composite_reward import compute_composite_reward
+    
+    # Compute composite reward with all dimensions using min-max normalization
+    composite_result = compute_composite_reward(
+        response=solution_str,
+        tournament_cumulative_score=tournament_cumulative_score,
+        ground_truth=ground_truth or {},
+        mcp_parser_name=mcp_parser_name,
+        min_tournament_score=min_tournament_score,
+        max_tournament_score=max_tournament_score,
+        gpt_judge_config=gpt_judge_config,
+    )
+    
     result: dict[str, float] = {
-        "score": final_reward,
-        "gpt_judge_normalized_score": float(normalized_tournament_score),
-        "final_reward": final_reward,
-        "tournament_cumulative_score": 0.0,  # will be overwritten by compute_score_batch for multi-rollout
+        "score": float(composite_result["final_reward"]),
+        "gpt_judge_raw_score": float(composite_result["gpt_judge_raw_score"]),
+        "gpt_judge_normalized_score": float(composite_result["gpt_judge_normalized_score"]),
+        "citation_reward": float(composite_result["citation_reward"]),
+        "citation_format_reward": float(composite_result["citation_format_reward"]),
+        "citation_avg_claim_recall": float(composite_result["citation_avg_claim_recall"]),
+        "citation_avg_claim_precision": float(composite_result["citation_avg_claim_precision"]),
+        "citation_avg_claim_f1": float(composite_result["citation_avg_claim_f1"]),
+        "citation_num_claims": float(composite_result["citation_num_claims"]),
+        "format_reward": float(composite_result["format_reward"]),
+        "search_turns_reward": float(composite_result["search_turns_reward"]),
+        "num_search_turns": float(composite_result["num_search_turns"]),
+        "final_reward": float(composite_result["final_reward"]),
+        "tournament_cumulative_score": float(tournament_cumulative_score),
     }
 
-    if format_penalty == "strict":
-        result["format_reward"] = format_reward
-        result["retrieval_reward"] = retrieval_reward
-        result["cite_reward"] = cite_reward
-        result["sum_format_reward"] = sum_format_reward
-        result["citation_violation"] = float(format_result.get("citation_violation", 0.0))
-        result["naked_text"] = float(format_result.get("naked_text", 0.0))
-    else:
-        result["format_reward"] = format_reward
-        result["weighted_format_reward"] = float(weighted_format_reward)
+    return result
 
+
+async def _assemble_final_reward_async(
+    normalized_tournament_score: float,
+    solution_str: str,
+    tournament_cumulative_score: float = 0.0,
+    ground_truth: dict[str, Any] | None = None,
+    mcp_parser_name: str | None = None,
+    min_tournament_score: float = 0.0,
+    max_tournament_score: float = 10.0,
+    gpt_judge_config: dict[str, Any] | None = None,
+    citation_judge_semaphore: asyncio.Semaphore | None = None,
+) -> dict[str, float]:
+    from verl.utils.reward_score.tourrank_composite_reward import compute_composite_reward_async
+
+    composite_result = await compute_composite_reward_async(
+        response=solution_str,
+        tournament_cumulative_score=tournament_cumulative_score,
+        ground_truth=ground_truth or {},
+        mcp_parser_name=mcp_parser_name,
+        min_tournament_score=min_tournament_score,
+        max_tournament_score=max_tournament_score,
+        gpt_judge_config=gpt_judge_config,
+        semaphore=citation_judge_semaphore,
+    )
+
+    result: dict[str, float] = {
+        "score": float(composite_result["final_reward"]),
+        "gpt_judge_raw_score": float(composite_result["gpt_judge_raw_score"]),
+        "gpt_judge_normalized_score": float(composite_result["gpt_judge_normalized_score"]),
+        "citation_reward": float(composite_result["citation_reward"]),
+        "citation_format_reward": float(composite_result["citation_format_reward"]),
+        "citation_avg_claim_recall": float(composite_result["citation_avg_claim_recall"]),
+        "citation_avg_claim_precision": float(composite_result["citation_avg_claim_precision"]),
+        "citation_avg_claim_f1": float(composite_result["citation_avg_claim_f1"]),
+        "citation_num_claims": float(composite_result["citation_num_claims"]),
+        "format_reward": float(composite_result["format_reward"]),
+        "search_turns_reward": float(composite_result["search_turns_reward"]),
+        "num_search_turns": float(composite_result["num_search_turns"]),
+        "final_reward": float(composite_result["final_reward"]),
+        "tournament_cumulative_score": float(tournament_cumulative_score),
+    }
     return result
 
 
@@ -680,7 +715,7 @@ async def compute_score_batch(
     gpt_judge : dict, optional
         GPT judge config overrides.
     reward_kwargs : dict, optional
-        Extra reward kwargs (e.g. ``format_penalty``).
+        Extra reward kwargs.
 
     Returns
     -------
@@ -688,7 +723,6 @@ async def compute_score_batch(
         Per-rollout reward dicts (same order as *items*).
     """
     reward_kwargs = _as_dict(reward_kwargs)
-    format_penalty = str(kwargs.get("format_penalty", reward_kwargs.get("format_penalty", "easy")))
     cfg = _get_judge_config(gpt_judge=gpt_judge, **kwargs)
 
     num_repeats = max(1, int(cfg.get("num_tournament_repeats", 1)))
@@ -744,17 +778,28 @@ async def compute_score_batch(
     norm_scores = _normalize_tournament_scores(total_scores, equal_score_reward=equal_score_reward)
 
     # Assemble per-item results
-    results: list[dict[str, float]] = []
-    for i, item in enumerate(items):
-        result = _assemble_final_reward(
+    # Calculate min and max tournament scores for relative normalization
+    min_tournament_score = min(total_scores) if total_scores else 0.0
+    max_tournament_score = max(total_scores) if total_scores else 10.0
+    
+    citation_judge_semaphore = asyncio.Semaphore(max(1, int(cfg.get("citation_judge_max_concurrency", 8))))
+    result_tasks = [
+        _assemble_final_reward_async(
             normalized_tournament_score=norm_scores[i],
             solution_str=solution_strs[i],
-            format_penalty=format_penalty,
+            tournament_cumulative_score=total_scores[i],
+            ground_truth=items[i].get("ground_truth"),
+            mcp_parser_name=cfg.get("mcp_parser_name"),
+            min_tournament_score=min_tournament_score,
+            max_tournament_score=max_tournament_score,
+            gpt_judge_config=cfg,
+            citation_judge_semaphore=citation_judge_semaphore,
         )
-        result["tournament_cumulative_score"] = total_scores[i]
+        for i in range(n)
+    ]
+    results = await asyncio.gather(*result_tasks)
+    for result in results:
         result["tournament_num_repeats"] = float(num_repeats)
-        results.append(result)
-
     return results
 
 
@@ -770,23 +815,28 @@ def compute_score(
     extra_info: dict[str, Any] | None = None,
     gpt_judge: dict[str, Any] | None = None,
     reward_kwargs: dict[str, Any] | None = None,
-    format_penalty: str = "easy",
     **kwargs,
 ) -> dict[str, float]:
     """Single-rollout fallback.
 
     When only one rollout is available (or the reward manager calls per-item),
-    we fall back to giving a neutral tournament score of 0.5 and rely on format
-    reward only.  The real tournament comparison happens in
-    ``compute_score_batch``.
+    we fall back to giving a neutral tournament score of 0.5 and compute
+    composite reward with citation, format, and search turn components.
+    The real tournament comparison happens in ``compute_score_batch``.
     """
-    reward_kwargs = _as_dict(reward_kwargs)
-    format_penalty = str(kwargs.get("format_penalty", reward_kwargs.get("format_penalty", format_penalty)))
-
+    cfg = _get_judge_config(gpt_judge=gpt_judge, **kwargs)
+    mcp_parser_name = cfg.get("mcp_parser_name")
+    
+    # For single-item fallback, use neutral min/max scores
     return _assemble_final_reward(
         normalized_tournament_score=0.5,
         solution_str=solution_str,
-        format_penalty=format_penalty,
+        tournament_cumulative_score=0.0,
+        ground_truth=ground_truth if isinstance(ground_truth, dict) else {},
+        mcp_parser_name=mcp_parser_name,
+        min_tournament_score=0.0,
+        max_tournament_score=10.0,
+        gpt_judge_config=cfg,
     )
 
 

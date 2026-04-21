@@ -126,33 +126,8 @@ def extract_search_tool_calls(context: str, mcp_parser_name: Optional[str] = Non
     return [match[1].strip() for match in matches if match[1].strip()]
 
 
-def _normalize_format_penalty(format_penalty: Optional[str]) -> str:
-    penalty = (format_penalty or "easy").lower()
-    if penalty not in {"easy", "strict"}:
-        raise ValueError(f"Unsupported format_penalty: {format_penalty!r}. Expected 'easy' or 'strict'.")
-    return penalty
-
-
 def _extract_answer_blocks(response: str) -> list[re.Match[str]]:
     return list(re.finditer(r"<answer>.*?</answer>", response, re.DOTALL))
-
-
-def _compute_easy_format_reward(
-    response: str, mcp_parser_name: Optional[str] = None, use_full_response_as_answer: bool = False
-) -> float:
-    if use_full_response_as_answer:
-        return 1.0
-
-    answer_match = re.search(r"<answer>.*?</answer>", response, re.DOTALL)
-    answer_format_reward = 1.0 if answer_match else 0.0
-
-    citation_match = re.search(r"<cite id=[\"\']?[^\"\'>\s]+[\"\']?[^>]*>[^<]+</cite>", response, re.DOTALL)
-    citation_format_reward = 1.0 if citation_match else 0.0
-
-    queries = extract_search_tool_calls(response, mcp_parser_name=mcp_parser_name)
-    query_format_reward = 1.0 if queries else 0.0
-
-    return 0.5 * answer_format_reward + 0.3 * citation_format_reward + 0.2 * query_format_reward
 
 
 def _extract_model_generated_text(response: str) -> str:
@@ -417,31 +392,18 @@ def compute_format_reward(
     response: str,
     mcp_parser_name: Optional[str] = None,
     use_full_response_as_answer: bool = False,
-    format_penalty: str = "easy",
-) -> dict[str, float] | float:
-    """Compute format reward.
+    format_penalty: Optional[str] = None,
+) -> dict[str, float]:
+    """Compute strict format reward.
 
-    Returns:
-        - **strict** mode: ``dict`` with keys ``format_reward``, ``retrieval_reward``,
-          ``sum_format_reward``.
-        - **easy** mode: a single ``float`` (backwards-compatible).
+    The legacy ``format_penalty`` switch is ignored; only the original strict
+    format reward is retained.
     """
-    format_penalty = _normalize_format_penalty(format_penalty)
-    if format_penalty == "strict":
-        return _compute_strict_format_reward(
-            response,
-            mcp_parser_name=mcp_parser_name,
-            use_full_response_as_answer=use_full_response_as_answer,
-        )
-
-    return _compute_easy_format_reward(
+    return _compute_strict_format_reward(
         response,
         mcp_parser_name=mcp_parser_name,
         use_full_response_as_answer=use_full_response_as_answer,
     )
-
-
-FORMAT_REWARD_WEIGHT = 0.2
 
 
 def compute_score_em(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
@@ -514,7 +476,7 @@ def compute_score(
     format_score=0.0,
     score=1.0,
     extra_info=None,
-    format_penalty="easy",
+    format_penalty=None,
     **kwargs,
 ):
     extra_info = extra_info or {}
@@ -525,20 +487,12 @@ def compute_score(
     format_result = compute_format_reward(
         solution_str,
         mcp_parser_name=mcp_parser_name,
-        format_penalty=format_penalty,
     )
-
-    if isinstance(format_result, dict):
-        # strict mode returns a dict
-        format_reward = format_result["format_reward"]
-        retrieval_reward = format_result["retrieval_reward"]
-        cite_reward = format_result["cite_reward"]
-        sum_format_reward = format_result["sum_format_reward"]
-        effective_format_score = sum_format_reward
-    else:
-        # easy mode returns a float
-        format_reward = format_result
-        effective_format_score = format_reward
+    format_reward = format_result["format_reward"]
+    retrieval_reward = format_result["retrieval_reward"]
+    cite_reward = format_result["cite_reward"]
+    sum_format_reward = format_result["sum_format_reward"]
+    effective_format_score = sum_format_reward
 
     answer = extract_solution(solution_str=solution_str)
     is_correct = answer is not None and subem_check(answer, ground_truth["target"])
@@ -554,12 +508,9 @@ def compute_score(
         "format_reward": format_reward,
         "accuracy_reward": float(is_correct),
     }
-    if isinstance(format_result, dict):
-        result["retrieval_reward"] = retrieval_reward
-        result["cite_reward"] = cite_reward
-        result["sum_format_reward"] = sum_format_reward
-        result["citation_violation"] = format_result.get("citation_violation", 0.0)
-        result["naked_text"] = format_result.get("naked_text", 0.0)
-    else:
-        result["weighted_format_reward"] = FORMAT_REWARD_WEIGHT * format_reward
+    result["retrieval_reward"] = retrieval_reward
+    result["cite_reward"] = cite_reward
+    result["sum_format_reward"] = sum_format_reward
+    result["citation_violation"] = format_result.get("citation_violation", 0.0)
+    result["naked_text"] = format_result.get("naked_text", 0.0)
     return result

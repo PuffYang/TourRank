@@ -96,3 +96,10 @@ gpt_judge:
   score_increment: 1.0
   # Max concurrent GPT judge calls (across groups within a round).
   max_concurrency: 8
+  # Citation judge model used for DR-Tulu-style citation recall / precision.
+  citation_judge_model: gpt-4o
+  citation_judge_temperature: 0.0
+  citation_judge_max_tokens: 800
+  citation_judge_timeout: 200
+  # Max concurrent citation-judge LLM calls across claims within a batch.
+  citation_judge_max_concurrency: 8
